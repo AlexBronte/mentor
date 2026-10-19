@@ -1,0 +1,11 @@
+groq
+vllm
+langchain-core
+langchain-community
+langchain-huggingface
+sentence-transformers
+faiss-cpu
+evaluate
+sacrebleu
+rouge-score
+pandas
