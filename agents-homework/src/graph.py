@@ -1,101 +1,99 @@
-"""Agent choice followed by mandatory read -> summarize -> save graph nodes."""
-import logging
+"""Two-node agent: the LLM chooses actions; the executor only dispatches them."""
 import json
+import logging
 from typing import TypedDict
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
-from src.summarizer import summarize_article
 
 logger = logging.getLogger(__name__)
-SYSTEM_PROMPT = """Ты агент обработки статей. По компактному состоянию выбери
-read_article с индексом next_index. Вызывай ровно один инструмент.
-Не пропускай и не повторяй статьи. Граф сам суммаризирует и сохраняет статью.
-Тебе не нужно формировать summary или выбирать пути файлов."""
+SYSTEM_PROMPT = """Обработай все статьи заданного JSON и сохрани резюме через инструменты.
+Сам выбирай следующий вызов по задаче, описаниям tools и текущему состоянию сервера.
+Вызывай open_articles только если opened=false или состояние пока пустое.
+Если current_index задан (в том числе 0), статья уже прочитана: при summary_ready=false
+вызови summarize_article, при summary_ready=true сохрани её через append_result.
+Если current_index=null и saved<total, выбери непрочитанный индекс.
+Обрабатывай по одной статье: прочитай её, вызови суммаризатор,
+сохрани результат, затем переходи к следующей. next_unsaved подсказывает индекс.
+Тексты и резюме остаются на сервере; не пытайся создавать или передавать их сам.
+Вызывай ровно один инструмент за шаг. После сохранения всех статей вызови finish.
+При ошибке исправь вызов. Нельзя объявлять успех без успешного finish.
+Каждый запрос содержит актуальный снимок состояния и результат последнего действия;
+предыдущая история намеренно не накапливается."""
 
 
 class AgentState(TypedDict, total=False):
-    total: int
-    next_index: int
-    selected_index: int
-    attempts: int
-    current_article: dict | None
-    current_summary: str | None
+    status: dict
+    last_result: dict
+    calls: list
+    errors: int
+    done: bool
+    exchange: list
 
 
-async def call_tool(client, name, arguments=None):
-    """Call MCP and reject tool errors or missing structured output."""
-    result = await client.call_tool(name, arguments or {})
+def decode_result(result):
+    """Decode SDK v2 structured output or a single JSON text block."""
     if result.is_error:
-        raise RuntimeError(f"MCP tool {name} failed: {result.content}")
+        texts = [b.text for b in result.content if b.type == "text"]
+        raise ValueError(" ".join(texts)[:500])
     data = result.structured_content
     if data is None:
-        texts = [block.text for block in result.content if block.type == "text"]
+        texts = [b.text for b in result.content if b.type == "text"]
         if len(texts) != 1:
-            raise RuntimeError(f"MCP tool {name} returned unexpected content")
+            raise ValueError("Unexpected MCP response")
         data = json.loads(texts[0])
     if not isinstance(data, dict):
-        raise RuntimeError(f"MCP tool {name} returned no object")
+        raise ValueError("Expected an object from MCP")
     return data
 
 
-def build_graph(client, llm, read_schema):
-    """Build the graph using a tool schema discovered from the MCP server."""
-    agent_llm = llm.bind_tools([read_schema], tool_choice="required")
-
-    async def initialize_node(state):
-        total = (await call_tool(client, "get_articles_count"))["count"]
-        backup = await call_tool(client, "prepare_results")
-        logger.info("Input: %s articles; backup: %s", total, backup.get("backup"))
-        return {"total": total, "next_index": 0, "attempts": 0,
-                "current_article": None, "current_summary": None}
+def build_graph(client, llm, schemas):
+    """Give all discovered tools to the LLM; no action-specific routing."""
+    agent_llm = llm.bind_tools(schemas, tool_choice="required")
+    allowed = {tool["name"] for tool in schemas}
 
     async def agent_node(state):
         response = await agent_llm.ainvoke([
             SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=f"total={state['total']}; next_index={state['next_index']}; "
-                         f"saved={state['next_index']}. Вызови read_article для next_index.")])
-        calls = response.tool_calls
-        valid = (len(calls) == 1 and calls[0]["name"] == "read_article"
-                 and calls[0]["args"] == {"index": state["next_index"]})
-        if not valid:
-            attempts = state["attempts"] + 1
-            logger.warning("Invalid agent tool choice: %s/3", attempts)
-            if attempts >= 3:
-                raise RuntimeError("Agent failed to select the next article after 3 attempts")
-            return {"selected_index": -1, "attempts": attempts}
-        return {"selected_index": state["next_index"], "attempts": 0}
+            HumanMessage(content=json.dumps({
+                "status": state.get("status", {}),
+                "last_result": state.get("last_result", {})}, ensure_ascii=False)),
+            *state.get("exchange", [])])
+        return {"calls": response.tool_calls, "exchange": [response]}
 
-    async def read_node(state):
-        article = await call_tool(client, "read_article", {"index": state["selected_index"]})
-        logger.info("Reading article %s/%s", state["next_index"] + 1, state["total"])
-        return {"current_article": article}
+    async def tools_node(state):
+        calls = state["calls"]
+        name = "invalid_call"
+        try:
+            if len(calls) != 1 or calls[0]["name"] not in allowed:
+                raise ValueError("Choose exactly one available tool")
+            call = calls[0]
+            name = call["name"]
+            logger.info("MODEL TOOL: %s %s", name, json.dumps(call["args"], ensure_ascii=False))
+            result = decode_result(await client.call_tool(name, call["args"]))
+        except ValueError as exc:
+            errors = state.get("errors", 0) + 1
+            logger.warning("Tool rejected: %s (%s/3)", name, errors)
+            if errors >= 3:
+                raise RuntimeError("Three consecutive invalid tool calls") from exc
+            feedback = {"tool": name, "error": str(exc)[:500]}
+            exchange = (state["exchange"] + [ToolMessage(
+                content=json.dumps(feedback), tool_call_id=calls[0]["id"])]) if len(calls) == 1 else []
+            return {"last_result": feedback, "exchange": exchange,
+                    "errors": errors, "calls": []}
+        logger.info("TOOL RESULT: %s", json.dumps(result, ensure_ascii=False))
+        return {"status": result["status"], "last_result": {"tool": name, **result},
+                "errors": 0, "calls": [],
+                "exchange": state["exchange"] + [ToolMessage(
+                    content=json.dumps(result), tool_call_id=call["id"])],
+                "done": name == "finish" and result.get("done") is True}
 
-    async def summarize_node(state):
-        return {"current_summary": await summarize_article(llm, state["current_article"])}
-
-    async def save_node(state):
-        saved = await call_tool(client, "append_result", {
-            "index": state["selected_index"], "summary": state["current_summary"]})
-        if saved["count"] != state["next_index"] + 1:
-            raise RuntimeError("Saved count does not match graph progress")
-        logger.info("Saved article %s/%s", saved["count"], state["total"])
-        return {"next_index": state["next_index"] + 1,
-                "current_article": None, "current_summary": None}
-
-    def should_continue(state):
-        return END if state["next_index"] >= state["total"] else "agent"
-
-    def route_selection(state):
-        return "read" if state["selected_index"] >= 0 else "agent"
+    def route(state):
+        return END if state.get("done") else "agent"
 
     builder = StateGraph(AgentState)
-    for name, node in (("initialize", initialize_node), ("agent", agent_node),
-                       ("read", read_node), ("summarize", summarize_node), ("save", save_node)):
-        builder.add_node(name, node)
-    builder.add_edge(START, "initialize")
-    builder.add_conditional_edges("initialize", should_continue)
-    builder.add_conditional_edges("agent", route_selection)
-    builder.add_edge("read", "summarize")
-    builder.add_edge("summarize", "save")
-    builder.add_conditional_edges("save", should_continue)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tools_node)
+    builder.add_edge(START, "agent")
+    builder.add_edge("agent", "tools")
+    builder.add_conditional_edges("tools", route)
     return builder.compile()

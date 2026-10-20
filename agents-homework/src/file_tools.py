@@ -56,11 +56,6 @@ def prepare_results(file_path):
     return {"backup": str(backup) if backup else None}
 
 
-def get_articles_count(articles):
-    """Return count without transferring article text."""
-    return len(articles)
-
-
 def read_article(articles, index):
     """Read exactly one article, rejecting invalid indices."""
     if type(index) is not int or not 0 <= index < len(articles):
