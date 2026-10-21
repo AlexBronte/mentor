@@ -9,3 +9,5 @@ evaluate
 sacrebleu
 rouge-score
 pandas
+PyYAML
+ipykernel
