@@ -4,21 +4,10 @@ import logging
 from typing import TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
+from src.prompts import load_prompt
 
 logger = logging.getLogger(__name__)
-SYSTEM_PROMPT = """Обработай все статьи заданного JSON и сохрани резюме через инструменты.
-Сам выбирай следующий вызов по задаче, описаниям tools и текущему состоянию сервера.
-Вызывай open_articles только если opened=false или состояние пока пустое.
-Если current_index задан (в том числе 0), статья уже прочитана: при summary_ready=false
-вызови summarize_article, при summary_ready=true сохрани её через append_result.
-Если current_index=null и saved<total, выбери непрочитанный индекс.
-Обрабатывай по одной статье: прочитай её, вызови суммаризатор,
-сохрани результат, затем переходи к следующей. next_unsaved подсказывает индекс.
-Тексты и резюме остаются на сервере; не пытайся создавать или передавать их сам.
-Вызывай ровно один инструмент за шаг. После сохранения всех статей вызови finish.
-При ошибке исправь вызов. Нельзя объявлять успех без успешного finish.
-Каждый запрос содержит актуальный снимок состояния и результат последнего действия;
-предыдущая история намеренно не накапливается."""
+SYSTEM_PROMPT = load_prompt("agent")
 
 
 class AgentState(TypedDict, total=False):
